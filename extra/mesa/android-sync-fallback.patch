@@ -1,0 +1,102 @@
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index eefbad2282e..d4c26babd13 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -694,7 +694,7 @@ fd_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+     * to the kernel for the fence to be added to the backing GEM
+     * object.
+     */
+-   if (ctx->no_implicit_sync)
++   if (ctx->no_implicit_sync && !ctx->screen->is_kgsl)
+       return;
+ 
+    flush_resource(ctx, rsc, PIPE_MAP_READ);
+@@ -703,6 +703,15 @@ fd_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+     * way to the kernel:
+     */
+    fd_resource_wait(ctx, rsc, FD_BO_PREP_FLUSH);
++
++   /* KGSL does not attach Mesa's tracked render fence to an exported dma-buf,
++    * so merely submitting the batch is insufficient before an implicit-sync
++    * consumer presents it.  Wait for the local render fence as a correctness
++    * fallback.  The common BO layer performs this wait before KGSL's no-op
++    * external implicit-sync preparation is reached.
++    */
++   if (ctx->screen->is_kgsl)
++      fd_resource_wait(ctx, rsc, FD_BO_PREP_READ);
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index d53612b9485..4ef887b5cd7 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -43,6 +43,7 @@
+ #include "util/u_memory.h"
+ #include "util/u_screen.h"
+ #include "util/u_string.h"
++#include "util/libsync.h"
+ #include "util/perf/u_trace.h"
+ #include "util/u_transfer_helper.h"
+ #include "util/hex.h"
+@@ -2537,8 +2538,6 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+ {
+ #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
+    static bool no_dma_buf_sync_file = false;
+-   if (no_dma_buf_sync_file)
+-      return sem;
+ 
+    const VkSemaphoreGetFdInfoKHR get_fd_info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+@@ -2552,23 +2551,39 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+    }
+ 
+    bool ret = false;
+-   int fd = zink_resource_get_dma_buf(screen, res);
+-   if (fd != -1) {
+-      struct dma_buf_import_sync_file import = {
+-         .flags = DMA_BUF_SYNC_RW,
+-         .fd = sync_file_fd,
+-      };
+-      int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
+-      if (ioctl_ret) {
+-         if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+-            no_dma_buf_sync_file = true;
++   bool imported = false;
++   if (!no_dma_buf_sync_file) {
++      int fd = zink_resource_get_dma_buf(screen, res);
++      if (fd != -1) {
++         struct dma_buf_import_sync_file import = {
++            .flags = DMA_BUF_SYNC_RW,
++            .fd = sync_file_fd,
++         };
++         int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
++         if (ioctl_ret) {
++            if (errno == ENOTTY || errno == EBADF || errno == ENOSYS)
++               no_dma_buf_sync_file = true;
+             ret = true;
+          } else {
+-            ret = true;
++            imported = true;
+          }
++         close(fd);
++      } else {
++         ret = true;
+       }
+-      close(fd);
++   } else {
++      ret = true;
+    }
++
++   /* Some Android dma-buf implementations do not support attaching the
++    * Vulkan release fence with DMA_BUF_IOCTL_IMPORT_SYNC_FILE.  Closing the
++    * sync fd in that case lets the consumer see the buffer before rendering
++    * completes.  A CPU wait is slower, but preserves presentation ordering.
++    */
++   if (!imported && sync_wait(sync_file_fd, -1))
++      mesa_loge("MESA: failed to wait for exported sync file '%s'",
++                strerror(errno));
++
+    close(sync_file_fd);
+    return ret;
+ #else
