@@ -1,0 +1,771 @@
+diff --git a/src/egl/drivers/dri2/platform_x11_dri3.c b/src/egl/drivers/dri2/platform_x11_dri3.c
+index 3c5a90ac..a79f3a3c 100644
+--- a/src/egl/drivers/dri2/platform_x11_dri3.c
++++ b/src/egl/drivers/dri2/platform_x11_dri3.c
+@@ -101,12 +101,22 @@ egl_dri3_flush_drawable(struct loader_dri3_drawable *draw, unsigned flags)
+    dri2_flush_drawable_for_swapbuffers(disp, &dri3_surf->surf.base);
+ }
+ 
++static int
++egl_dri3_flush_drawable_with_fence_fd(struct loader_dri3_drawable *draw,
++                                      unsigned flags)
++{
++   return loader_dri3_flush_with_fence_fd(
++      draw, __DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_INVALIDATE_ANCILLARY,
++      __DRI2_THROTTLE_SWAPBUFFER);
++}
++
+ static const struct loader_dri3_vtable egl_dri3_vtable = {
+    .set_drawable_size = egl_dri3_set_drawable_size,
+    .in_current_context = egl_dri3_in_current_context,
+    .get_dri_context = egl_dri3_get_dri_context,
+    .get_dri_screen = egl_dri3_get_dri_screen,
+    .flush_drawable = egl_dri3_flush_drawable,
++   .flush_drawable_with_fence_fd = egl_dri3_flush_drawable_with_fence_fd,
+ };
+ 
+ static EGLBoolean
+diff --git a/src/gallium/drivers/freedreno/freedreno_batch.c b/src/gallium/drivers/freedreno/freedreno_batch.c
+index 22172e57..334c6a17 100644
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -386,6 +386,14 @@ batch_flush(struct fd_batch *batch, bool last_batch)
+    if (last_batch && !batch->fence)
+       batch->fence = fd_pipe_fence_create(batch);
+ 
++   /* flush_resource() can submit the drawable's writer before the frontend's
++    * context flush reaches fd_context_flush().  Mark that writer's fence for
++    * native-fd export here so the Present fence still comes from the rendering
++    * submission rather than a following empty submit.
++    */
++   if (last_batch && batch->ctx->explicit_present_fence && batch->fence)
++      batch->fence->use_fence_fd = true;
++
+    if (batch->fence)
+       fd_pipe_fence_ref(&batch->ctx->last_fence, batch->fence);
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_context.c b/src/gallium/drivers/freedreno/freedreno_context.c
+index a453d5d3..24be91b1 100644
+--- a/src/gallium/drivers/freedreno/freedreno_context.c
++++ b/src/gallium/drivers/freedreno/freedreno_context.c
+@@ -44,6 +44,7 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
+       fd_bc_dump(ctx, "need fence, last_fence=%p", ctx->last_fence);
+       batch = fd_context_batch(ctx);
+    } else if (!batch) {
++      ctx->explicit_present_fence = false;
+       return;
+    }
+ 
+@@ -118,6 +119,8 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
+    fd_bc_dump(ctx, "%p: remaining:\n", ctx);
+ 
+ out:
++   ctx->explicit_present_fence = false;
++
+    if (fencep)
+       fd_pipe_fence_ref(fencep, fence);
+ 
+@@ -134,6 +137,21 @@ out:
+       assert(pctx->get_device_reset_status(pctx) == PIPE_NO_RESET);
+ }
+ 
++static void
++fd_set_context_param(struct pipe_context *pctx, enum pipe_context_param param,
++                     unsigned value)
++{
++   struct fd_context *ctx = fd_context(pctx);
++
++   switch (param) {
++   case PIPE_CONTEXT_PARAM_EXPLICIT_PRESENT_FENCE:
++      ctx->explicit_present_fence = value;
++      break;
++   default:
++      break;
++   }
++}
++
+ static void
+ fd_texture_barrier(struct pipe_context *pctx, unsigned flags) in_dt
+ {
+@@ -699,6 +717,7 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
+    pctx->screen = pscreen;
+    pctx->priv = priv;
+    pctx->flush = fd_context_flush;
++   pctx->set_context_param = fd_set_context_param;
+    pctx->emit_string_marker = fd_emit_string_marker;
+    pctx->set_debug_callback = fd_set_debug_callback;
+    pctx->create_fence_fd = fd_create_pipe_fence_fd;
+diff --git a/src/gallium/drivers/freedreno/freedreno_context.h b/src/gallium/drivers/freedreno/freedreno_context.h
+index 79529aac..6b31855a 100644
+--- a/src/gallium/drivers/freedreno/freedreno_context.h
++++ b/src/gallium/drivers/freedreno/freedreno_context.h
+@@ -358,6 +358,11 @@ struct fd_context {
+     */
+    struct pipe_fence_handle *last_fence dt;
+ 
++   /* The next context flush exports the render-completion fence directly to
++    * the window-system presentation path.
++    */
++   bool explicit_present_fence;
++
+    /*
+     * Counter to keep track of batch's most recent update.  Ie. the batch with
+     * the higher update count is the one that has been drawn/etc to the most
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index eefbad22..3d9e9d9d 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -694,7 +694,7 @@ fd_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+     * to the kernel for the fence to be added to the backing GEM
+     * object.
+     */
+-   if (ctx->no_implicit_sync)
++   if (ctx->no_implicit_sync && !ctx->screen->is_kgsl)
+       return;
+ 
+    flush_resource(ctx, rsc, PIPE_MAP_READ);
+@@ -703,6 +703,15 @@ fd_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+     * way to the kernel:
+     */
+    fd_resource_wait(ctx, rsc, FD_BO_PREP_FLUSH);
++
++   /* KGSL does not attach Mesa's tracked render fence to an exported dma-buf.
++    * If the window-system path is not carrying the next submission's native
++    * fence explicitly, wait here before handing the resource to an
++    * implicit-sync consumer.  The explicit Present-fence path avoids this
++    * per-frame CPU stall.
++    */
++   if (ctx->screen->is_kgsl && !ctx->explicit_present_fence)
++      fd_resource_wait(ctx, rsc, FD_BO_PREP_READ);
+ }
+ 
+ static void
+diff --git a/src/gallium/frontends/dri/dri_drawable.c b/src/gallium/frontends/dri/dri_drawable.c
+index cb027a25..2d3e7a42 100644
+--- a/src/gallium/frontends/dri/dri_drawable.c
++++ b/src/gallium/frontends/dri/dri_drawable.c
+@@ -455,28 +455,33 @@ notify_before_flush_cb(void* _args)
+  * \param flags             a combination of _DRI2_FLUSH_xxx flags
+  * \param throttle_reason   the reason for throttling, 0 = no throttling
+  */
+-void
+-dri_flush(struct dri_context *ctx,
+-          struct dri_drawable *drawable,
+-          unsigned flags,
+-          enum __DRI2throttleReason reason)
++static int
++dri_flush_impl(struct dri_context *ctx,
++               struct dri_drawable *drawable,
++               unsigned flags,
++               enum __DRI2throttleReason reason,
++               bool request_fence_fd)
+ {
+    struct st_context *st;
++   struct pipe_screen *screen;
++   struct pipe_fence_handle *new_fence = NULL;
+    unsigned flush_flags;
++   int fence_fd = -1;
+    struct notify_before_flush_cb_args args = { 0 };
+ 
+    if (!ctx) {
+       assert(0);
+-      return;
++      return -1;
+    }
+ 
+    st = ctx->st;
++   screen = ctx->screen->base.screen;
+    _mesa_glthread_finish(st->ctx);
+ 
+    if (drawable) {
+       /* prevent recursion */
+       if (drawable->flushing)
+-         return;
++         return -1;
+ 
+       drawable->flushing = true;
+    }
+@@ -505,23 +510,53 @@ dri_flush(struct dri_context *ctx,
+        reason == __DRI2_NOTHROTTLE_SWAPBUFFER)
+       flush_flags |= ST_FLUSH_END_OF_FRAME;
+ 
+-   /* Flush the context and throttle if needed. */
+-   if (ctx->screen->throttle &&
+-       drawable &&
+-       (reason == __DRI2_THROTTLE_SWAPBUFFER ||
+-        reason == __DRI2_THROTTLE_FLUSHFRONT)) {
++   if (request_fence_fd && screen->caps.native_fence_fd) {
++      if (st->pipe->set_context_param) {
++         st->pipe->set_context_param(st->pipe,
++                                     PIPE_CONTEXT_PARAM_EXPLICIT_PRESENT_FENCE,
++                                     true);
++      }
++      flush_flags |= ST_FLUSH_FENCE_FD;
++   } else {
++      request_fence_fd = false;
++   }
+ 
+-      struct pipe_screen *screen = drawable->screen->base.screen;
+-      struct pipe_fence_handle *new_fence = NULL;
++   /* Flush the context and throttle if needed. */
++   const bool throttle = ctx->screen->throttle && drawable &&
++      (reason == __DRI2_THROTTLE_SWAPBUFFER ||
++       reason == __DRI2_THROTTLE_FLUSHFRONT);
+ 
++   if ((flags & (__DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_CONTEXT)) &&
++       (throttle || request_fence_fd)) {
+       st_context_flush(st, flush_flags, &new_fence, args.ctx ? notify_before_flush_cb : NULL, &args);
+ 
+-      /* throttle on the previous fence */
+-      if (drawable->throttle_fence) {
+-         screen->fence_finish(screen, NULL, drawable->throttle_fence, OS_TIMEOUT_INFINITE);
+-         screen->fence_reference(screen, &drawable->throttle_fence, NULL);
++      if (request_fence_fd && new_fence)
++         fence_fd = screen->fence_get_fd(screen, new_fence);
++
++      /* If native-fence export failed after the rendering flush, wait on the
++       * exact pipe fence before allowing an unfenced Present request.
++       */
++      if (request_fence_fd && fence_fd < 0) {
++         if (!new_fence)
++            st_context_flush(st, 0, &new_fence, NULL, NULL);
++         if (new_fence)
++            screen->fence_finish(screen, NULL, new_fence,
++                                 OS_TIMEOUT_INFINITE);
+       }
+-      drawable->throttle_fence = new_fence;
++
++      if (throttle) {
++         /* throttle on the previous fence */
++         if (drawable->throttle_fence) {
++            screen->fence_finish(screen, NULL, drawable->throttle_fence,
++                                 OS_TIMEOUT_INFINITE);
++            screen->fence_reference(screen, &drawable->throttle_fence, NULL);
++         }
++         drawable->throttle_fence = new_fence;
++         new_fence = NULL;
++      }
++
++      if (new_fence)
++         screen->fence_reference(screen, &new_fence, NULL);
+    }
+    else if (flags & (__DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_CONTEXT)) {
+       st_context_flush(st, flush_flags, NULL, args.ctx ? notify_before_flush_cb : NULL, &args);
+@@ -550,6 +585,25 @@ dri_flush(struct dri_context *ctx,
+    }
+ 
+    st_context_invalidate_state(st, ST_INVALIDATE_FB_STATE);
++   return fence_fd;
++}
++
++void
++dri_flush(struct dri_context *ctx,
++          struct dri_drawable *drawable,
++          unsigned flags,
++          enum __DRI2throttleReason reason)
++{
++   dri_flush_impl(ctx, drawable, flags, reason, false);
++}
++
++int
++dri_flush_with_fence_fd(struct dri_context *ctx,
++                        struct dri_drawable *drawable,
++                        unsigned flags,
++                        enum __DRI2throttleReason reason)
++{
++   return dri_flush_impl(ctx, drawable, flags, reason, true);
+ }
+ 
+ /**
+diff --git a/src/gallium/frontends/dri/dri_drawable.h b/src/gallium/frontends/dri/dri_drawable.h
+index 4605c8a6..27775dbf 100644
+--- a/src/gallium/frontends/dri/dri_drawable.h
++++ b/src/gallium/frontends/dri/dri_drawable.h
+@@ -152,6 +152,12 @@ dri_flush(struct dri_context *ctx,
+           unsigned flags,
+           enum __DRI2throttleReason reason);
+ 
++int
++dri_flush_with_fence_fd(struct dri_context *ctx,
++                        struct dri_drawable *drawable,
++                        unsigned flags,
++                        enum __DRI2throttleReason reason);
++
+ void
+ dri_flush_drawable(struct dri_drawable *dPriv);
+ 
+diff --git a/src/gallium/frontends/dri/dri_util.h b/src/gallium/frontends/dri/dri_util.h
+index 96713679..c9f16729 100644
+--- a/src/gallium/frontends/dri/dri_util.h
++++ b/src/gallium/frontends/dri/dri_util.h
+@@ -192,6 +192,11 @@ dri_flush(struct dri_context *cPriv,
+           struct dri_drawable *dPriv,
+           unsigned flags,
+           enum __DRI2throttleReason reason);
++PUBLIC int
++dri_flush_with_fence_fd(struct dri_context *cPriv,
++                        struct dri_drawable *dPriv,
++                        unsigned flags,
++                        enum __DRI2throttleReason reason);
+ PUBLIC void
+ dri_invalidate_drawable(struct dri_drawable *drawable);
+ 
+diff --git a/src/gallium/frontends/dri/loader_dri3_helper.c b/src/gallium/frontends/dri/loader_dri3_helper.c
+index 62c8bb96..f214898b 100644
+--- a/src/gallium/frontends/dri/loader_dri3_helper.c
++++ b/src/gallium/frontends/dri/loader_dri3_helper.c
+@@ -22,21 +22,30 @@
+  */
+ 
+ #include <fcntl.h>
++#include <errno.h>
++#include <poll.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <string.h>
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
+ 
+ #include <xcb/xcb.h>
+ #include <xcb/dri3.h>
+ #include <xcb/present.h>
++#include <xcb/sync.h>
+ 
+ #include <X11/Xlib-xcb.h>
+ 
+ #include "loader_dri_helper.h"
+ #include "loader_dri3_helper.h"
+ #include "pipe/p_screen.h"
++#include "drm-uapi/dma-buf.h"
++#include "util/libsync.h"
+ #include "util/log.h"
+ #include "util/macros.h"
++#include "util/u_atomic.h"
++#include "util/u_queue.h"
+ #include "util/simple_mtx.h"
+ #include "drm-uapi/drm_fourcc.h"
+ #include "dri_screen.h"
+@@ -57,6 +66,203 @@ static struct loader_dri3_blit_context blit_context = {
+    SIMPLE_MTX_INITIALIZER, NULL
+ };
+ 
++struct loader_dri3_present_sync {
++   struct util_queue queue;
++   int cancel_fd;
++};
++
++struct loader_dri3_present_job {
++   xcb_connection_t *conn;
++   xcb_sync_fence_t fence;
++   int *fence_triggered;
++   int fence_fd;
++   int cancel_fd;
++};
++
++static void
++dri3_present_job_execute(void *data, void *gdata, int thread_index)
++{
++   struct loader_dri3_present_job *job = data;
++   struct pollfd fds[2] = {
++      { .fd = job->fence_fd, .events = POLLIN },
++      { .fd = job->cancel_fd, .events = POLLIN },
++   };
++   int ret;
++
++   do {
++      ret = poll(fds, ARRAY_SIZE(fds), -1);
++   } while (ret < 0 && errno == EINTR);
++
++   if (ret < 0) {
++      mesa_loge("DRI3: failed to wait for presentation fence: %s",
++                strerror(errno));
++   }
++
++   if (ret > 0 && fds[1].revents)
++      return;
++
++   /* A sync_file normally signals with POLLIN.  Trigger on an error too so a
++    * broken fence cannot leave the X server permanently blocked.
++    */
++   if (ret > 0 && !(fds[0].revents & POLLIN))
++      mesa_loge("DRI3: presentation fence reported poll events 0x%x",
++                fds[0].revents);
++
++   /* Queue TriggerFence under XCB's connection lock before publishing the
++    * state.  Any ResetFence submitted by the reuse thread after observing the
++    * state is therefore serialized after this trigger request.
++    */
++   xcb_sync_trigger_fence(job->conn, job->fence);
++   p_atomic_set(job->fence_triggered, true);
++   xcb_flush(job->conn);
++}
++
++static void
++dri3_present_job_cleanup(void *data, void *gdata, int thread_index)
++{
++   struct loader_dri3_present_job *job = data;
++
++   close(job->fence_fd);
++   free(job);
++}
++
++static void
++dri3_present_sync_fini(struct loader_dri3_drawable *draw)
++{
++   struct loader_dri3_present_sync *sync = draw->present_sync;
++
++   if (!sync)
++      return;
++
++   eventfd_write(sync->cancel_fd, 1);
++   util_queue_finish(&sync->queue);
++   util_queue_destroy(&sync->queue);
++   close(sync->cancel_fd);
++   free(sync);
++   draw->present_sync = NULL;
++}
++
++static bool
++dri3_dmabuf_sync_file_unavailable(int fd)
++{
++   struct dma_buf_export_sync_file export = {
++      .flags = DMA_BUF_SYNC_RW,
++      .fd = -1,
++   };
++
++   if (ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export) == 0) {
++      close(export.fd);
++      return false;
++   }
++
++   return errno == ENOTTY || errno == ENOSYS;
++}
++
++static bool
++dri3_present_sync_init(struct loader_dri3_drawable *draw, int buffer_fd)
++{
++   struct loader_dri3_present_sync *sync;
++
++   if (draw->present_sync_checked)
++      return draw->present_sync != NULL;
++
++   draw->present_sync_checked = true;
++
++   if (draw->type != LOADER_DRI3_DRAWABLE_WINDOW ||
++       draw->dri_screen_render_gpu != draw->dri_screen_display_gpu ||
++       !(dri_fence_get_caps(draw->dri_screen_render_gpu) &
++         __DRI_FENCE_CAP_NATIVE_FD) ||
++       !dri3_dmabuf_sync_file_unavailable(buffer_fd))
++      return false;
++
++   sync = calloc(1, sizeof(*sync));
++   if (!sync)
++      return false;
++
++   sync->cancel_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++   if (sync->cancel_fd < 0)
++      goto fail;
++
++   if (!util_queue_init(&sync->queue, "present", 8, 1,
++                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL))
++      goto fail_cancel_fd;
++
++   draw->present_sync = sync;
++   return true;
++
++fail_cancel_fd:
++   close(sync->cancel_fd);
++fail:
++   free(sync);
++   return false;
++}
++
++static void
++dri3_setup_present_wait_fence(struct loader_dri3_drawable *draw,
++                              struct loader_dri3_buffer *buffer)
++{
++   if (!draw->present_sync)
++      return;
++
++   buffer->present_wait_fence = xcb_generate_id(draw->conn);
++   xcb_void_cookie_t cookie =
++      xcb_sync_create_fence_checked(draw->conn, draw->window,
++                                    buffer->present_wait_fence, false);
++   xcb_generic_error_t *error = xcb_request_check(draw->conn, cookie);
++   if (error) {
++      mesa_loge("DRI3: failed to create Present wait fence: X error %u",
++                error->error_code);
++      free(error);
++      buffer->present_wait_fence = 0;
++   }
++}
++
++static xcb_sync_fence_t
++dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
++                              struct loader_dri3_buffer *buffer,
++                              int fence_fd)
++{
++   struct loader_dri3_present_job *job;
++
++   if (fence_fd < 0)
++      return XCB_NONE;
++
++   if (!draw->present_sync || !buffer->present_wait_fence)
++      goto sync_fallback;
++
++   job = calloc(1, sizeof(*job));
++   if (!job)
++      goto sync_fallback;
++
++   job->conn = draw->conn;
++   job->fence = buffer->present_wait_fence;
++   job->fence_triggered = &buffer->present_wait_fence_triggered;
++   job->fence_fd = fence_fd;
++   job->cancel_fd = draw->present_sync->cancel_fd;
++
++   /* A Sync fence remains triggered until its owner resets it.  Reset only
++    * after our previous worker has triggered this per-buffer fence; resetting
++    * an unsignaled fence is a Sync Match error.  XCB serializes the reset
++    * before the new worker's trigger request on the shared connection.
++    */
++   if (p_atomic_read(&buffer->present_wait_fence_triggered)) {
++      xcb_sync_reset_fence(draw->conn, buffer->present_wait_fence);
++      p_atomic_set(&buffer->present_wait_fence_triggered, false);
++   }
++
++   util_queue_add_job(&draw->present_sync->queue, job, NULL,
++                      dri3_present_job_execute, dri3_present_job_cleanup,
++                      sizeof(*job));
++   return buffer->present_wait_fence;
++
++sync_fallback:
++   if (sync_wait(fence_fd, -1))
++      mesa_loge("DRI3: failed to wait for presentation fence: %s",
++                strerror(errno));
++   close(fence_fd);
++   return XCB_NONE;
++}
++
+ static void
+ dri3_flush_present_events(struct loader_dri3_drawable *draw);
+ 
+@@ -335,6 +541,11 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
+    if (!buffer)
+       return;
+ 
++   if (buffer->present_wait_fence && draw->present_sync)
++      util_queue_finish(&draw->present_sync->queue);
++
++   if (buffer->present_wait_fence)
++      xcb_sync_destroy_fence(draw->conn, buffer->present_wait_fence);
+    if (buffer->own_pixmap)
+       xcb_free_pixmap(draw->conn, buffer->pixmap);
+    dri2_destroy_image(buffer->image);
+@@ -353,6 +564,7 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
+ {
+    int i;
+ 
++   dri3_present_sync_fini(draw);
+    driDestroyDrawable(draw->dri_drawable);
+ 
+    for (i = 0; i < ARRAY_SIZE(draw->buffers); i++)
+@@ -400,6 +612,8 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
+    draw->multiplanes_available = multiplanes_available;
+    draw->prefer_back_buffer_reuse = prefer_back_buffer_reuse;
+    draw->queries_buffer_age = false;
++   draw->present_sync_checked = false;
++   draw->present_sync = NULL;
+ 
+    draw->have_back = 0;
+    draw->have_fake_front = 0;
+@@ -823,6 +1037,20 @@ loader_dri3_flush(struct loader_dri3_drawable *draw,
+    }
+ }
+ 
++int
++loader_dri3_flush_with_fence_fd(struct loader_dri3_drawable *draw,
++                                unsigned flags,
++                                enum __DRI2throttleReason throttle_reason)
++{
++   struct dri_context *dri_context = draw->vtable->get_dri_context(draw);
++
++   if (!dri_context)
++      return -1;
++
++   return dri_flush_with_fence_fd(dri_context, draw->dri_drawable, flags,
++                                  throttle_reason);
++}
++
+ void
+ loader_dri3_copy_sub_buffer(struct loader_dri3_drawable *draw,
+                             int x, int y,
+@@ -1000,6 +1228,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+ {
+    struct loader_dri3_buffer *back;
+    int64_t ret = 0;
++   int render_fence_fd = -1;
+    bool wait_for_next_buffer = false;
+ 
+    /* GLX spec:
+@@ -1030,12 +1259,22 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+    if (!draw->have_back || draw->type == LOADER_DRI3_DRAWABLE_PIXMAP)
+       return ret;
+ 
+-   draw->vtable->flush_drawable(draw, flush_flags);
++   if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
++       draw->present_sync &&
++       draw->vtable->flush_drawable_with_fence_fd) {
++      render_fence_fd =
++         draw->vtable->flush_drawable_with_fence_fd(draw, flush_flags);
++   } else {
++      draw->vtable->flush_drawable(draw, flush_flags);
++   }
+ 
+    back = dri3_find_back_alloc(draw);
+    /* Could only happen when error case, like display is already closed. */
+-   if (!back)
++   if (!back) {
++      if (render_fence_fd >= 0)
++         close(render_fence_fd);
+       return ret;
++   }
+ 
+    mtx_lock(&draw->mtx);
+ 
+@@ -1160,6 +1399,9 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+       back->busy = 1;
+       back->last_swap = draw->send_sbc;
+ 
++      xcb_sync_fence_t wait_fence =
++         dri3_queue_present_wait_fence(draw, back, render_fence_fd);
++
+       xcb_xfixes_region_t region = 0;
+ 
+       xcb_present_pixmap(draw->conn,
+@@ -1171,7 +1413,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+                          0,                                    /* x_off */
+                          0,                                    /* y_off */
+                          None,                                 /* target_crtc */
+-                         None,
++                         wait_fence,
+                          back->sync_fence,
+                          options,
+                          target_msc,
+@@ -1559,6 +1801,12 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+    if (!ret)
+       buffer->modifier = DRM_FORMAT_MOD_INVALID;
+ 
++   /* Android's dma-buf implementation may lack sync-file import/export even
++    * though DRI3 buffer sharing itself works.  In that case Present needs an
++    * explicit render-completion fence.
++    */
++   dri3_present_sync_init(draw, buffer_fds[0]);
++
+    if (draw->dri_screen_render_gpu != draw->dri_screen_display_gpu &&
+        draw->dri_screen_display_gpu && linear_buffer_display_gpu) {
+       /* The linear buffer was created in the display GPU's vram, so we
+@@ -1616,6 +1864,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+    buffer->own_pixmap = true;
+    buffer->width = width;
+    buffer->height = height;
++   dri3_setup_present_wait_fence(draw, buffer);
+ 
+    /* Mark the buffer as idle
+     */
+diff --git a/src/gallium/frontends/dri/loader_dri3_helper.h b/src/gallium/frontends/dri/loader_dri3_helper.h
+index 26f138d1..6104050d 100644
+--- a/src/gallium/frontends/dri/loader_dri3_helper.h
++++ b/src/gallium/frontends/dri/loader_dri3_helper.h
+@@ -65,6 +65,8 @@ struct loader_dri3_buffer {
+     */
+ 
+    uint32_t     sync_fence;     /* XID of X SyncFence object */
++   uint32_t     present_wait_fence; /* GPU completion fence for Present */
++   int          present_wait_fence_triggered;
+    struct xshmfence *shm_fence; /* pointer to xshmfence object */
+    bool         busy;           /* Set on swap, cleared on IdleNotify */
+    bool         own_pixmap;     /* We allocated the pixmap ID, free on destroy */
+@@ -95,6 +97,7 @@ loader_dri3_pixmap_buf_id(enum loader_dri3_buffer_type buffer_type)
+ }
+ 
+ struct loader_dri3_drawable;
++struct loader_dri3_present_sync;
+ 
+ struct loader_dri3_vtable {
+    void (*set_drawable_size)(struct loader_dri3_drawable *, int, int);
+@@ -102,6 +105,8 @@ struct loader_dri3_vtable {
+    struct dri_context *(*get_dri_context)(struct loader_dri3_drawable *);
+    struct dri_screen *(*get_dri_screen)(void);
+    void (*flush_drawable)(struct loader_dri3_drawable *, unsigned);
++   int (*flush_drawable_with_fence_fd)(struct loader_dri3_drawable *,
++                                       unsigned);
+ };
+ 
+ #define LOADER_DRI3_NUM_BUFFERS (1 + LOADER_DRI3_MAX_BACK)
+@@ -168,8 +173,11 @@ struct loader_dri3_drawable {
+    bool adaptive_sync_active;
+    bool block_on_depleted_buffers;
+    bool queries_buffer_age;
++   bool present_sync_checked;
+    int swap_interval;
+ 
++   struct loader_dri3_present_sync *present_sync;
++
+    const struct loader_dri3_vtable *vtable;
+ 
+    unsigned int back_format;
+@@ -231,6 +239,11 @@ loader_dri3_flush(struct loader_dri3_drawable *draw,
+                   unsigned flags,
+                   enum __DRI2throttleReason throttle_reason);
+ 
++PUBLIC int
++loader_dri3_flush_with_fence_fd(struct loader_dri3_drawable *draw,
++                                unsigned flags,
++                                enum __DRI2throttleReason throttle_reason);
++
+ PUBLIC void
+ loader_dri3_copy_sub_buffer(struct loader_dri3_drawable *draw,
+                             int x, int y,
+diff --git a/src/gallium/include/pipe/p_defines.h b/src/gallium/include/pipe/p_defines.h
+index e2bd3cda..91bc4afc 100644
+--- a/src/gallium/include/pipe/p_defines.h
++++ b/src/gallium/include/pipe/p_defines.h
+@@ -1204,6 +1204,12 @@ enum pipe_context_param
+     * benefits from it.
+     */
+    PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
++
++   /* The next flush is used as an explicit presentation fence.  Drivers may
++    * use this to avoid implicit-sync fallbacks while the frontend requests a
++    * native fence from the same submission.
++    */
++   PIPE_CONTEXT_PARAM_EXPLICIT_PRESENT_FENCE,
+ };
+ 
+ /**
+diff --git a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
+index 5eb08eaf..0a2ef15d 100644
+--- a/src/glx/dri3_glx.c
++++ b/src/glx/dri3_glx.c
+@@ -132,12 +132,21 @@ glx_dri3_flush_drawable(struct loader_dri3_drawable *draw, unsigned flags)
+    loader_dri3_flush(draw, flags, __DRI2_THROTTLE_SWAPBUFFER);
+ }
+ 
++static int
++glx_dri3_flush_drawable_with_fence_fd(struct loader_dri3_drawable *draw,
++                                      unsigned flags)
++{
++   return loader_dri3_flush_with_fence_fd(draw, flags,
++                                          __DRI2_THROTTLE_SWAPBUFFER);
++}
++
+ static const struct loader_dri3_vtable glx_dri3_vtable = {
+    .set_drawable_size = glx_dri3_set_drawable_size,
+    .in_current_context = glx_dri3_in_current_context,
+    .get_dri_context = glx_dri3_get_dri_context,
+    .get_dri_screen = glx_dri3_get_dri_screen,
+    .flush_drawable = glx_dri3_flush_drawable,
++   .flush_drawable_with_fence_fd = glx_dri3_flush_drawable_with_fence_fd,
+ };
+ 
+ 
