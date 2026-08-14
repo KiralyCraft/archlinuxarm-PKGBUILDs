@@ -19,7 +19,7 @@ pkgname=(
 )
 pkgver=26.2.0
 _pkgver=${pkgver/[a-z]/-&}
-pkgrel=5.2
+pkgrel=5.3
 epoch=1
 pkgdesc="Open-source OpenGL drivers"
 url="https://www.mesa3d.org/"
@@ -89,18 +89,22 @@ options=(
 source=(
   "mesa::git+https://github.com/lfdevs/mesa-for-android-container.git#tag=mesa-26.2.0-devel-20260709"
   android-present-wait-fence.patch
+  kgsl-deferred-submit-lifetime.patch
 )
 
 b2sums=('SKIP'
-        'c269a84aa39f47890c35fe48d307f6c0e74545789fbaad71ed108df4b3e7f99613a046789b9342e0fad0aaff5756175e9e79d906427e50f47871f09e776af537')
+        'c269a84aa39f47890c35fe48d307f6c0e74545789fbaad71ed108df4b3e7f99613a046789b9342e0fad0aaff5756175e9e79d906427e50f47871f09e776af537'
+        '0f38be25fbd4ba0d9bb3859a2ad2fded2405e3caface4df984c567e45f14f8159677597154c40f2cc289533be79aeb62966f2854ce83d8fa7404d05faff6391c')
 
 sha256sums=('SKIP'
-            '950ba42363613d9ccd3e812bb16469fff855827781b8d465716e782759b942fe')
+            '950ba42363613d9ccd3e812bb16469fff855827781b8d465716e782759b942fe'
+            '71ce44c556a7b5df350b90eb70311c2873e82475b30b385c8d661f81dc4afcea')
 
 prepare() {
   cd mesa
 
   patch -Np1 -i ../android-present-wait-fence.patch
+  patch -Np1 -i ../kgsl-deferred-submit-lifetime.patch
 
   # Include package release in version string so Chromium invalidates
   # its GPU cache; otherwise it can cause pages to render incorrectly.

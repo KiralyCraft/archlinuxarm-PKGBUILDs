@@ -1,7 +1,7 @@
 pkgbase = mesa
 	pkgdesc = Open-source OpenGL drivers
 	pkgver = 26.2.0
-	pkgrel = 5.2
+	pkgrel = 5.3
 	epoch = 1
 	url = https://www.mesa3d.org/
 	arch = aarch64
@@ -55,10 +55,13 @@ pkgbase = mesa
 	options = !lto
 	source = mesa::git+https://github.com/lfdevs/mesa-for-android-container.git#tag=mesa-26.2.0-devel-20260709
 	source = android-present-wait-fence.patch
+	source = kgsl-deferred-submit-lifetime.patch
 	sha256sums = SKIP
 	sha256sums = 950ba42363613d9ccd3e812bb16469fff855827781b8d465716e782759b942fe
+	sha256sums = 71ce44c556a7b5df350b90eb70311c2873e82475b30b385c8d661f81dc4afcea
 	b2sums = SKIP
 	b2sums = c269a84aa39f47890c35fe48d307f6c0e74545789fbaad71ed108df4b3e7f99613a046789b9342e0fad0aaff5756175e9e79d906427e50f47871f09e776af537
+	b2sums = 0f38be25fbd4ba0d9bb3859a2ad2fded2405e3caface4df984c567e45f14f8159677597154c40f2cc289533be79aeb62966f2854ce83d8fa7404d05faff6391c
 
 pkgname = mesa
 	depends = expat
@@ -80,7 +83,7 @@ pkgname = mesa
 	depends = zlib
 	depends = zstd
 	optdepends = opengl-man-pages: for the OpenGL API man pages
-	provides = mesa-libgl=1:26.2.0-5.2
+	provides = mesa-libgl=1:26.2.0-5.3
 	provides = opengl-driver
 	conflicts = libva-mesa-driver<1:24.2.7-1
 	conflicts = mesa-libgl<17.0.1-2

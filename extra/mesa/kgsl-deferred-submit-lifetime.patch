@@ -1,0 +1,21 @@
+diff --git a/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c b/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
+index e8b2842a..c4843a1f 100644
+--- a/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
++++ b/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
+@@ -62,3 +61,0 @@ flush_submit_list(struct list_head *submit_list)
+-
+-        list_del(&submit->node);
+-        fd_submit_del(submit);
+@@ -111,0 +109,12 @@ fail:
++    /* Keep merged submits alive until KGSL has consumed the command list and,
++     * on success, populated the shared kernel timestamp.  Dropping them before
++     * IOCTL_KGSL_GPU_COMMAND can free BOs that the command stream still uses.
++     */
++    foreach_submit_safe (submit, submit_list) {
++        if (submit == last_submit(submit_list))
++            break;
++
++        list_del(&submit->node);
++        fd_submit_del(submit);
++    }
++
